@@ -1,5 +1,5 @@
 /**
- * Verification harness for dsh-instance-switcher's browser half.
+ * Verification harness for dsh-remote-switch's browser half.
  *
  * Emulates the two host contracts the bundle actually touches:
  *   1. the official client module loader — `window.__ModuleLoader__.load({ id,
@@ -15,15 +15,17 @@
  * without jsdom (not installed here) or the shell's bundled React (not
  * require-able).
  *
- * Asserted: factory/inject/registration contract, the collapsed rail, opening
- * the panel fetches the peer list, one row per instance with the current one
- * highlighted, the multi-instance selection box, the switch navigation URL
- * (with credential, and without one for 本机), and the loopback-only fence on
- * the add form and the probe buttons.
+ * Asserted: the registered module id matches the package name, the
+ * factory/inject/registration contract, the trigger's borderless official
+ * styling in both column states, opening the panel fetches the peer list, the
+ * peer state it renders from, the entry-URL builder used to open a peer in a
+ * new window, the click-away catcher, and the loopback-only fence on the add
+ * form and the probe buttons.
  *
  * Usage: node scripts/verify-client.mjs
  */
 
+import { readFileSync } from 'node:fs'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 
@@ -252,10 +254,18 @@ const requireStub = (request) => {
 }
 
 await import(pathToFileURL(path.resolve('lib/client.js')).href)
-check('bundle registers its factory under the package id', registered.has('dsh-instance-switcher'),
-  `ids=[${[...registered.keys()].join(', ')}]`)
 
-const factory = registered.get('dsh-instance-switcher')
+// The id the bundle registers MUST equal the package's own name: the host's
+// boot graph addresses the browser bundle by that name, so a rename that misses
+// `lib/client.js` leaves the plugin silently unloaded in the browser. Deriving
+// the expectation from package.json — instead of hardcoding it — is what makes
+// this suite fail on that mistake.
+const packageName = JSON.parse(readFileSync(path.resolve('package.json'), 'utf8')).name
+check('bundle registers its factory under the package id',
+  registered.has(packageName),
+  `expected=${String(packageName)} ids=[${[...registered.keys()].join(', ')}]`)
+
+const factory = registered.get(packageName)
 const exports = factory === undefined ? undefined : factory(requireStub)
 check('factory materializes exports', typeof exports?.apply === 'function',
   `keys=[${exports !== undefined ? Object.keys(exports).join(', ') : 'none'}]`)
@@ -263,6 +273,8 @@ check('inject list names the slots service', Array.isArray(exports?.inject) && e
   JSON.stringify(exports?.inject))
 
 // ── the slots emulation ────────────────────────────────────────────────────
+// A missing factory (e.g. the id/name mismatch above) must fail as checks, not
+// as an unhandled TypeError that buries the real cause.
 let capture = null
 let injected = null
 const ctx = {
@@ -270,6 +282,11 @@ const ctx = {
     inject(name, callback) { injected = name; return callback() },
     register(options, component) { capture = { options, component }; return () => { capture = null } },
   },
+}
+if (typeof exports?.apply !== 'function') {
+  check('the bundle exposes apply()', false, 'cannot drive the slots contract without a factory')
+  console.log(`\n0/${String(results.length)} passed`)
+  process.exit(1)
 }
 exports.apply(ctx)
 check('registers into the sidebar footer seat', injected === 'sidebar.footer.action' && capture !== null,

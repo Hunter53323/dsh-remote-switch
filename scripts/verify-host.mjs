@@ -1,5 +1,5 @@
 /**
- * Verification harness for dsh-instance-switcher's host half.
+ * Verification harness for dsh-remote-switch's host half.
  *
  * Mounts the real route handlers on a plain node:http server with a stubbed
  * cordis context, then exercises the whole stored-credential flow against a
@@ -7,7 +7,9 @@
  *   1. mint a one-time pairing token on the target (loopback-only route)
  *   2. POST the pasted link  -> the plugin redeems it server-side and stores
  *      the resulting device credential
- *   3. GET  the peer list    -> origin + credential present
+ *   3. GET  the peer list    -> origin + credential present, and only for a
+ *      loopback caller or a live paired-device session (regression: this list
+ *      carries credentials and must never answer an unpaired LAN caller)
  *   4. POST /test            -> reachable AND credentialLive
  *   5. POST /test bad cred   -> credentialLive === false (the dead-credential path)
  *   6. non-loopback POST     -> 403 (the mutation fence)

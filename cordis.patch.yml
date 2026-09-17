@@ -1,0 +1,5 @@
+# dsh-remote-switch bundle patch: inserts only this plugin into a profile's
+# layer stack. Nothing else is mounted and nothing upstream is modified.
+- insert:
+    - id: instance-switcher
+      name: 'dsh-remote-switch'

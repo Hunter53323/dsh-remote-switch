@@ -1,0 +1,4 @@
+# Keep line endings stable for every checkout: this package is consumed by Node
+# on Windows, macOS and Linux, and the browser half is a hand-written bundle
+# served byte-for-byte.
+* text=auto eol=lf

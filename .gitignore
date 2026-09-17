@@ -1,0 +1,7 @@
+# DeepSeek Harness installs this plugin as a bundle. The DSH side (host half)
+# and the prebuilt browser half live in `lib/`; everything else is source for
+# humans, so nothing here needs a build step.
+node_modules/
+*.tgz
+*.log
+.DS_Store

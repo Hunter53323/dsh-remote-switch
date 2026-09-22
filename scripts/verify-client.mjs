@@ -96,6 +96,20 @@ const React = {
   useCallback(fn) {
     return fn
   },
+  useSyncExternalStore(subscribe, getSnapshot) {
+    // Real React subscribes during commit and re-reads on notify. Here the
+    // subscription is installed as an effect on the root store and the value is
+    // read at render time, which is enough to observe a publish.
+    const store = current
+    const index = store.cursor
+    store.cursor += 1
+    if (store.hooks[index] === undefined) {
+      store.hooks[index] = { value: getSnapshot() }
+      store.effects.push(() => subscribe(() => { store.hooks[index].value = getSnapshot() }))
+    }
+    store.hooks[index].value = getSnapshot()
+    return store.hooks[index].value
+  },
 }
 
 /**
@@ -117,6 +131,12 @@ function expand(node) {
       stores.set(component, store)
     }
     const previous = current
+    // Every component render starts reading its hooks from index 0. Without
+    // this reset a NESTED component's cursor keeps advancing across renders,
+    // so its `useState` calls silently shift onto the wrong hooks — which looks
+    // exactly like "state updates are being dropped" and makes every assertion
+    // about nested component state unreliable.
+    store.cursor = 0
     store.effects = []
     current = store
     const output = component(node.props)
@@ -149,13 +169,17 @@ function renderRoot(component, props) {
 
 /** Settle effects and the setState queue. */
 async function settle() {
-  for (let round = 0; round < 16; round += 1) {
+  for (let round = 0; round < 40; round += 1) {
     const pending = effectQueue.splice(0)
     for (const entry of pending) {
       const cleanup = entry.effect()
       if (typeof cleanup === 'function') entry.owner.cleanups = [...(entry.owner.cleanups ?? []), cleanup]
     }
-    if (pending.length > 0) await Promise.resolve()
+    // Yield to the macrotask queue so a component's own promise chain (a fetch,
+    // then a setState) can actually make progress between rounds. A microtask
+    // turn is not enough: those chains await several times, and the panel's
+    // entire rendered content arrives that way.
+    await new Promise(resolve => { setTimeout(resolve, 0) })
     if (updateQueue.length > 0) {
       updateQueue = []
       rootStore.cursor = 0
@@ -163,7 +187,12 @@ async function settle() {
       replaceTree(rootTree, expanded)
       continue
     }
-    if (pending.length === 0) return true
+    if (pending.length === 0) {
+      // Give a still-running chain one more turn before declaring quiet.
+      await new Promise(resolve => { setTimeout(resolve, 0) })
+      if (updateQueue.length === 0) return true
+      continue
+    }
   }
   return false
 }
@@ -230,6 +259,34 @@ const platform = { react: { default: React, ...React } }
 const navigations = []
 /** Windows `window.open` was asked to open, in call order. */
 const openedWindows = []
+/** Every `window.confirm` message, in call order. */
+const confirms = []
+/**
+ * What the next `window.confirm` answers. Flipped to false where a test needs to
+ * prove that declining really does nothing, then restored.
+ */
+let confirmAnswer = true
+
+/**
+ * Timers the panel installed through `window.setInterval`.
+ *
+ * A fake registry rather than the real thing: the panel is expected to install
+ * exactly one poll loop and to clear it, and asserting that is the only way to
+ * catch the regression this exists for (the panel fetched once on mount and
+ * never again, so the list and the running count froze while the host kept
+ * polling).
+ * @type {Map<number, { fn: Function, ms: number }>}
+ */
+const intervals = new Map()
+let nextIntervalId = 1
+
+/** `pagehide` listeners the panel registered, so their cleanup is assertable. */
+const pagehideListeners = new Set()
+
+/** Run every installed interval once, as the browser would after `ms`. */
+const fireIntervals = () => {
+  for (const { fn } of [...intervals.values()]) fn()
+}
 
 globalThis.window = {
   location: {
@@ -242,10 +299,31 @@ globalThis.window = {
   open(url, target, features) { openedWindows.push({ url, target, features }) },
   innerWidth: 1280,
   innerHeight: 800,
-  confirm: () => true,
+  confirm(message) {
+    confirms.push(String(message))
+    return confirmAnswer
+  },
+  setInterval(fn, ms) {
+    const id = nextIntervalId++
+    intervals.set(id, { fn, ms })
+    return id
+  },
+  clearInterval(id) { intervals.delete(id) },
+  addEventListener(type, fn) { if (type === 'pagehide') pagehideListeners.add(fn) },
+  removeEventListener(type, fn) { if (type === 'pagehide') pagehideListeners.delete(fn) },
+  __ModuleLoader__: { load(entry) { registered.set(entry.id, entry.factory) } },
+}
+
+// The shipped `index.html` hardcodes `lang="en"` and the frontend NEVER updates
+// it — verified against dsh-web-frontend/dist/index.html and the built assets.
+// Modelling that here is what makes the "trusts the locale service, not the DOM"
+// assertion below meaningful: a panel that read this attribute would render
+// English no matter what the locale service reports.
+globalThis.document = {
+  documentElement: { lang: 'en' },
+  createElement: () => ({ style: {}, setAttribute() {}, appendChild() {} }),
   addEventListener() {},
   removeEventListener() {},
-  __ModuleLoader__: { load(entry) { registered.set(entry.id, entry.factory) } },
 }
 
 const requireStub = (request) => {
@@ -271,16 +349,99 @@ check('factory materializes exports', typeof exports?.apply === 'function',
   `keys=[${exports !== undefined ? Object.keys(exports).join(', ') : 'none'}]`)
 check('inject list names the slots service', Array.isArray(exports?.inject) && exports.inject.includes('slots'),
   JSON.stringify(exports?.inject))
+// `locale` must be DECLARED, not merely read. An undeclared service is not
+// awaited and not guaranteed to be mounted, so the panel silently falls back to
+// its own heuristic — which is exactly how the whole UI ended up English
+// regardless of the user's setting. Every locale-registering plugin in this
+// profile declares it (dsh-pet, dsh-ssh, dsh-doctor, …).
+check('inject list also declares locale (reading it without declaring it silently degrades)',
+  Array.isArray(exports?.inject) && exports.inject.includes('locale'),
+  JSON.stringify(exports?.inject))
 
 // ── the slots emulation ────────────────────────────────────────────────────
 // A missing factory (e.g. the id/name mismatch above) must fail as checks, not
 // as an unhandled TypeError that buries the real cause.
-let capture = null
-let injected = null
+/** Seat name → the registration captured for it. */
+const captures = new Map()
+/** Seat names this plugin asked to inject into, in call order. */
+const injectedSeats = []
+/** Locale namespaces registered by the bundle, and the dictionaries handed over. */
+const registeredLocales = new Map()
+/** Effects the bundle scheduled through `ctx.effect`, run during teardown. */
+const effectDisposers = []
+
+/**
+ * A locale-registry substitute: enough of the real service's surface to pin that
+ * the bundle registers both dictionaries, that its `t` follows the active
+ * language, and — critically — that it reads the ACTIVE LOCALE from here rather
+ * than from the document.
+ *
+ * `getLocale()`/`getSnapshot()` mirror the real snapshot shape (`{active, …}`),
+ * because that is the authority the panel must consult: the shipped
+ * `index.html` hardcodes `lang="en"` and never updates it, so a panel that
+ * trusted the DOM would render English even when this stub says `zh`.
+ */
+let activeLanguage = 'zh'
+const localeListeners = new Set()
+const localeStub = {
+  register(ns, dicts) {
+    registeredLocales.set(ns, dicts)
+    return () => { registeredLocales.delete(ns) }
+  },
+  bind(ns) {
+    return (key, params) => {
+      const dict = registeredLocales.get(ns)?.[activeLanguage]
+      let text = dict?.[key] ?? key
+      if (params !== undefined) {
+        for (const [name, value] of Object.entries(params)) text = text.replaceAll(`{${name}}`, String(value))
+      }
+      return text
+    }
+  },
+  subscribe(fn) {
+    localeListeners.add(fn)
+    return () => { localeListeners.delete(fn) }
+  },
+  getLocale() {
+    return { active: activeLanguage, locales: [{ id: 'zh' }, { id: 'en' }], revision: 0 }
+  },
+  getSnapshot() {
+    return this.getLocale()
+  },
+}
+/** Switch the stubbed locale and notify, as the real runtime does. */
+function setLanguage(lang) {
+  activeLanguage = lang
+  for (const fn of [...localeListeners]) fn()
+}
+
 const ctx = {
+  locale: localeStub,
+  effect(callback) {
+    const dispose = callback()
+    if (typeof dispose === 'function') effectDisposers.push(dispose)
+    return dispose
+  },
   slots: {
-    inject(name, callback) { injected = name; return callback() },
-    register(options, component) { capture = { options, component }; return () => { capture = null } },
+    inject(name, callback) {
+      injectedSeats.push(name)
+      const registration = callback()
+      void registration
+      return registration
+    },
+    register(options, component) {
+      captures.set(options.name, { options, component })
+      return () => { captures.delete(options.name) }
+    },
+    // The layout refuses to select a key with no registration, which is the
+    // exact failure this suite exists to catch — so model the registry.
+    entries(name) {
+      if (name !== 'main') return []
+      return [...captures.values()].filter(entry => entry.options.name === 'main')
+    },
+    entriesOfSlot(name) {
+      return [...captures.values()].filter(entry => entry.options.name === name)
+    },
   },
 }
 if (typeof exports?.apply !== 'function') {
@@ -289,8 +450,62 @@ if (typeof exports?.apply !== 'function') {
   process.exit(1)
 }
 exports.apply(ctx)
-check('registers into the sidebar footer seat', injected === 'sidebar.footer.action' && capture !== null,
-  `inject=${String(injected)} name=${capture?.options?.name} id=${capture?.options?.id} order=${String(capture?.options?.order)}`)
+
+/** The instance-switcher footer registration. */
+const capture = captures.get('sidebar.footer.action')
+/** The remote-session panel-row registration. */
+const panelCapture = captures.get('sidebar.panellist')
+/** The keyed `main` registration, which must use the panellist's own id. */
+const mainCapture = captures.get('main')
+
+check('registers into the sidebar footer seat', injectedSeats.includes('sidebar.footer.action') && capture !== undefined,
+  `injected=[${injectedSeats.join(', ')}] id=${capture?.options?.id} order=${String(capture?.options?.order)}`)
+check('also registers a global panel row and its keyed main panel',
+  injectedSeats.includes('sidebar.panellist') && injectedSeats.includes('main') && panelCapture !== undefined && mainCapture !== undefined,
+  `seats=[${injectedSeats.join(', ')}] panel=${String(panelCapture?.options?.id)} main=${String(mainCapture?.options?.key)}`)
+// The sidebar's row selects a panel by its id and the layout throws when that
+// id has no `main` registration — so these two MUST be the same string, and
+// the sidebar must be able to read a label off the row.
+check('the panellist id and the main key are the same string',
+  panelCapture !== undefined && mainCapture !== undefined && panelCapture.options.id === mainCapture.options.key,
+  `id=${String(panelCapture?.options?.id)} key=${String(mainCapture?.options?.key)}`)
+// The sidebar resolves the row label through `resolveSlotLabel`, which calls a
+// function label on every render — that is what lets the row follow a language
+// switch. So the label may be a string OR a function, and this asserts the
+// resolved value either way.
+const resolvedLabel = typeof panelCapture?.options?.label === 'function'
+  ? panelCapture.options.label()
+  : panelCapture?.options?.label
+check('the panel row carries a label (the sidebar renders it, this plugin draws only the icon)',
+  typeof resolvedLabel === 'string' && resolvedLabel !== '',
+  `${typeof panelCapture?.options?.label} -> ${JSON.stringify(resolvedLabel)}`)
+check('the panel row declares a numeric order',
+  typeof panelCapture?.options?.order === 'number',
+  String(panelCapture?.options?.order))
+// The registry the layout consults must actually contain the key — this is the
+// check that would have caught an id/key drift as a thrown click, not a blank panel.
+check('the keyed main panel is registered in the main registry',
+  mainCapture !== undefined && ctx.slots.entries('main').some(entry => entry.options.key === mainCapture.options.key),
+  `main entries=[${ctx.slots.entries('main').map(entry => String(entry.options.key)).join(', ')}]`)
+
+// ── i18n ───────────────────────────────────────────────────────────────────
+check('both language dictionaries are registered under one namespace',
+  registeredLocales.size === 1 && (() => {
+    const dicts = [...registeredLocales.values()][0]
+    return dicts !== undefined && typeof dicts.zh === 'object' && typeof dicts.en === 'object'
+  })(),
+  `namespaces=[${[...registeredLocales.keys()].join(', ')}]`)
+const dictionaryPair = [...registeredLocales.values()][0] ?? {}
+const zhKeys = Object.keys(dictionaryPair.zh ?? {})
+const enKeys = Object.keys(dictionaryPair.en ?? {})
+// The registry rejects a namespace whose shipped languages carry different key
+// sets, so a missing translation is a registration failure — pin it here too.
+check('the two dictionaries carry identical key sets',
+  zhKeys.length > 0 && zhKeys.length === enKeys.length && zhKeys.every(key => enKeys.includes(key)),
+  `zh=${String(zhKeys.length)} en=${String(enKeys.length)} missing=${zhKeys.filter(key => !enKeys.includes(key)).join(',') || 'none'}`)
+check('the panel-row label is resolved lazily so it can follow a language switch',
+  typeof panelCapture?.options?.label === 'function',
+  typeof panelCapture?.options?.label)
 
 // ── a stubbed host surface ─────────────────────────────────────────────────
 // Mirrors the real frame: only stored peers, no synthesized local row.
@@ -319,9 +534,79 @@ const calls = []
 let resolveTest = null
 /** Origin the panel's relative requests resolve against. */
 const PAGE_ORIGIN = 'http://127.0.0.1:3080'
+
+/** The federation frame the stubbed host answers with, swapped per scenario. */
+let federationFrame = {
+  ok: true,
+  peers: [
+    {
+      id: 'f-1',
+      label: 'build-box',
+      channel: 'ssh',
+      origin: 'http://127.0.0.1:3080',
+      ssh: { host: '192.168.1.23', user: 'liuyx', port: 22, remotePort: 3080, privateKeyPath: 'C:\\k', hasPassword: true },
+      auth: { kind: 'token', hasToken: true },
+      webOrigin: 'http://192.168.1.23:3080',
+      jumpUrl: 'http://192.168.1.23:3080/pair-app?device=cafe',
+      createdAt: Date.now(),
+    },
+    {
+      id: 'f-2',
+      label: 'tunnel-only',
+      channel: 'ssh',
+      origin: 'http://127.0.0.1:3099',
+      ssh: { host: '10.0.0.9', user: 'root', port: 2222, remotePort: 3099 },
+      auth: { kind: 'device', hasToken: false },
+      createdAt: Date.now(),
+    },
+  ],
+  // Deliberately NOT the 15000 default: the panel's own fallback must not be
+  // able to satisfy the cadence assertion below by coincidence.
+  poll: { peerId: 'f-1', visible: true, intervalMs: 45000, failures: 0, running: true },
+  snapshots: [],
+  peerId: 'f-1',
+  status: 'ok',
+  snapshot: {
+    peerId: 'f-1',
+    items: [
+      { sessionId: 's-run', title: '修 build 脚本', cwd: 'E:\\work\\build', updatedAt: Date.now() - 5000, running: true },
+      { sessionId: 's-idle', title: '读日志', cwd: 'E:\\work\\build', updatedAt: Date.now() - 3600000, running: false },
+      { sessionId: 's-other', title: '随手试试', cwd: 'C:\\tmp', updatedAt: Date.now() - 90000, running: false },
+    ],
+    groups: [],
+    total: 3,
+    truncated: false,
+    warnings: [],
+    fetchedAt: Date.now(),
+  },
+}
+
+/** Frame the provision route answers with; swapped per scenario. */
+let provisionFrame = { id: 'f-1', action: 'status', listening: true, evidence: 'LISTEN 0 128 127.0.0.1:3080' }
+
 globalThis.fetch = async (url, init) => {
   const target = new URL(String(url), globalThis.window.location.href).href
-  calls.push({ url: target, method: init?.method ?? 'GET' })
+  calls.push({ url: target, method: init?.method ?? 'GET', body: init?.body })
+  if (target.includes('/api/federation/')) {
+    const suffix = target.slice(target.indexOf('/api/federation'))
+    const body = init?.body === undefined ? {} : JSON.parse(String(init.body))
+    if (suffix.startsWith('/api/federation/peers')) {
+      const payload = { ...federationFrame, saved: body.action === 'save' ? 'f-1' : undefined }
+      return { ok: true, status: 200, async json() { return payload } }
+    }
+    if (suffix.startsWith('/api/federation/poll')) {
+      return { ok: true, status: 200, async json() { return federationFrame } }
+    }
+    if (suffix.startsWith('/api/federation/test')) {
+      const payload = { ...federationFrame, probe: { id: 'f-1', ok: true, latencyMs: 7 } }
+      return { ok: true, status: 200, async json() { return payload } }
+    }
+    if (suffix.startsWith('/api/federation/provision')) {
+      const payload = { ...federationFrame, provision: provisionFrame }
+      return { ok: true, status: 200, async json() { return payload } }
+    }
+    return { ok: true, status: 200, async json() { return federationFrame } }
+  }
   if (target.endsWith('/test')) {
     const payload = { ok: true, reachable: true, credentialLive: true, latencyMs: 12 }
     return { ok: true, status: 200, async json() { resolveTest?.(payload); return payload } }
@@ -338,6 +623,19 @@ globalThis.fetch = async (url, init) => {
 function sawRequest(suffix, method) {
   return calls.some(call =>
     call.url.startsWith(`${PAGE_ORIGIN}/api/instance-switcher`) &&
+    call.url.endsWith(suffix) &&
+    (method === undefined || call.method === method))
+}
+
+/**
+ * Whether a federation route was called.
+ * @param {string} suffix - route suffix, e.g. '/sessions'.
+ * @param {string} [method] - required method.
+ * @returns {boolean} true when seen.
+ */
+function sawFed(suffix, method) {
+  return calls.some(call =>
+    call.url.startsWith(`${PAGE_ORIGIN}/api/federation`) &&
     call.url.endsWith(suffix) &&
     (method === undefined || call.method === method))
 }
@@ -489,6 +787,529 @@ const lanTree = await openPanel(true)
 const lanText = textOf(lanTree)
 check('a LAN page hides the mutate form', !lanText.includes('添加实例'), 'form hidden off-loopback')
 check('a LAN page explains why', lanText.includes('添加/移除/测试只在 127.0.0.1 页面可用'), 'explanation present')
+
+// ── the remote-session panel ───────────────────────────────────────────────
+// Restore the loopback page: the federation panel is local-only by design.
+window.location.hostname = '127.0.0.1'
+window.location.href = 'http://127.0.0.1:3080/'
+calls.length = 0
+openedWindows.length = 0
+
+const Icon = panelCapture.component
+const Panel = mainCapture.component
+
+// The icon is the only thing this plugin contributes to the panel row: the
+// sidebar owns the button, the label, and the click.
+const iconTree = renderRoot(Icon, { size: 16, active: false })
+await settle()
+check('the panel-row glyph renders without a label of its own',
+  textOf(iconTree).includes('🖧'), JSON.stringify(textOf(iconTree)))
+
+// The badge is self-drawn (owner props carry only size/active) and reads the
+// running count off the panel's published cache — a different React root, so it
+// must go through an external store rather than panel state.
+let badgeVisible = textOf(iconTree).includes('1')
+check('the badge is empty before any data arrives', !badgeVisible, JSON.stringify(textOf(iconTree)))
+
+const panelTree = renderRoot(Panel, {})
+await settle()
+check('the panel reads the current peer on mount', sawFed('/sessions', 'POST'),
+  calls.filter(call => call.url.includes('/api/federation')).map(call => `${call.method} ${call.url.split('/api/federation')[1]}`).join(' , ') || 'no federation call')
+check('mounting also tells the host the panel is visible so its poller runs',
+  sawFed('/poll', 'POST') || calls.some(call => call.url.endsWith('/api/federation/sessions') && String(call.body).includes('"visible":true')),
+  calls.filter(call => String(call.body).includes('visible')).map(call => String(call.body)).join(' , ') || 'no visibility signal')
+
+const fedPanelText = textOf(panelTree)
+check('the panel states that it is read-only', fedPanelText.includes('只读'), fedPanelText.slice(0, 80))
+check('the panel lists the sessions it was handed',
+  fedPanelText.includes('修 build 脚本') && fedPanelText.includes('读日志'),
+  fedPanelText.slice(0, 200))
+check('the panel groups by working directory', fedPanelText.includes('build'),
+  fedPanelText.slice(0, 200))
+check('a running session is marked as running', fedPanelText.includes('运行中'), fedPanelText.slice(0, 160))
+check('the header reports a running count', fedPanelText.includes('1 条运行中'), fedPanelText.slice(0, 120))
+check('the panel picks a peer from ONE list rather than a dropdown beside one',
+  findAll(panelTree, 'select').length === 0 && fedPanelText.includes('build-box') && fedPanelText.includes('tunnel-only'),
+  `${String(findAll(panelTree, 'select').length)} select(s)`)
+check('the panel offers an explicit refresh', findAll(panelTree, 'button').map(textOf).includes('刷新'),
+  findAll(panelTree, 'button').map(textOf).join(' | '))
+check('the panel offers to open the remote GUI', findAll(panelTree, 'button').map(textOf).includes('打开远端'),
+  findAll(panelTree, 'button').map(textOf).join(' | '))
+check('the panel exposes local search', findAll(panelTree, 'input').some(node => String(node.props.placeholder).includes('搜索')),
+  findAll(panelTree, 'input').map(node => String(node.props.placeholder)).join(' | '))
+check('the editor stays closed until a row asks for it',
+  !fedPanelText.includes('SSH 主机'),
+  findAll(panelTree, 'button').map(textOf).join(' | '))
+
+// The panel must keep asking. It did not: it fetched once on mount, so the list,
+// the running count and the icon badge all froze at mount time while the host
+// went on polling the remote forever — a poll loop with no reader.
+check('mounting the panel installs a poll loop',
+  intervals.size >= 1,
+  `${String(intervals.size)} interval(s): ${[...intervals.values()].map(entry => `${String(entry.ms)}ms`).join(' , ')}`)
+// The newest interval must be the host's cadence. `intervals` accumulates across
+// this harness's renders because its shallow renderer never runs the previous
+// mount's cleanup, so only the latest one is meaningful here.
+check('...at the cadence the host advertises rather than a hardcoded one',
+  [...intervals.values()].at(-1)?.ms === federationFrame.poll.intervalMs && federationFrame.poll.intervalMs !== 15000,
+  `${[...intervals.values()].map(entry => String(entry.ms)).join(' , ')} vs ${String(federationFrame.poll.intervalMs)}`)
+const callsBeforePoll = calls.filter(call => call.url.endsWith('/sessions')).length
+fireIntervals()
+await settle()
+check('...and firing it re-reads the session list',
+  calls.filter(call => call.url.endsWith('/sessions')).length > callsBeforePoll,
+  `${String(calls.filter(call => call.url.endsWith('/sessions')).length - callsBeforePoll)} extra /sessions call(s)`)
+// Closing the tab or reloading never unmounts a React tree, so the panel must
+// also stop the host's poller when the page goes away — otherwise the host keeps
+// reading that remote every interval for the rest of its life, with no viewer.
+check('leaving the page tells the host to stop polling',
+  pagehideListeners.size === 1 && typeof [...pagehideListeners][0] === 'function',
+  `${String(pagehideListeners.size)} pagehide listener(s)`)
+const callsBeforeHide = calls.length
+for (const listener of [...pagehideListeners]) listener()
+await settle()
+check('...with a visible:false poll request rather than only on unmount',
+  calls.slice(callsBeforeHide).some(call => call.url.endsWith('/poll') && String(call.body).includes('"visible":false')),
+  calls.slice(callsBeforeHide).map(call => `${call.method} ${call.url.split('/api/federation')[1] ?? call.url}`).join(' , ') || 'no call')
+
+// The host builds the jump URL precisely so the device credential never reaches
+// the browser; the panel must use it verbatim rather than reassembling one.
+const openButton = findAll(panelTree, 'button').find(button => textOf(button) === '打开远端')
+openButton?.props.onClick()
+await settle()
+check('opening the remote uses the host-built URL (credential stays host-side)',
+  openedWindows.length === 1 && openedWindows[0].url === federationFrame.peers[0].jumpUrl,
+  openedWindows.map(entry => entry.url).join(' , ') || 'nothing opened')
+check('the remote GUI opens in a NEW window and cannot reach back',
+  openedWindows.length === 1 && openedWindows[0].target === '_blank' && String(openedWindows[0].features).includes('noopener'),
+  JSON.stringify(openedWindows[0] ?? {}))
+
+// A peer reachable only through the tunnel has no browser origin at all: the
+// panel must NOT invent one (its `origin` is 127.0.0.1 on the *far* machine).
+check('a tunnel-only peer is not given a browser origin by the host frame',
+  federationFrame.peers[1].jumpUrl === undefined && federationFrame.peers[1].openOrigin === undefined,
+  JSON.stringify({ jumpUrl: federationFrame.peers[1].jumpUrl, openOrigin: federationFrame.peers[1].openOrigin }))
+
+// With no browser-reachable address the button must still be VISIBLE (hiding it
+// made the capability undiscoverable — the panel looked like it had no way to
+// open the remote at all) and clicking must EXPLAIN rather than do nothing.
+federationFrame = { ...federationFrame, peerId: 'f-2' }
+const tunnelOnlyTree = renderRoot(Panel, {})
+await settle()
+const noTargetButton = openButtonFor(tunnelOnlyTree, 'tunnel-only')
+check('the open-remote button stays visible even without a jump address',
+  noTargetButton !== undefined, findAll(tunnelOnlyTree, 'button').map(textOf).join(' | '))
+openedWindows.length = 0
+// Snapshot AFTER the mount, because mounting itself fetches the session list;
+// measuring from before it would blame that fetch on the click.
+const callsAfterMount = calls.length
+noTargetButton?.props.onClick()
+await settle()
+check('...and clicking it explains what to fill in instead of doing nothing',
+  openedWindows.length === 0 && textOf(tunnelOnlyTree).includes('跳转地址'),
+  `opened=${String(openedWindows.length)} message=${textOf(tunnelOnlyTree).slice(-160)}`)
+check('...and no request is made for a peer that cannot be opened',
+  calls.length === callsAfterMount, `${String(calls.length - callsAfterMount)} extra call(s)`)
+// Restore the active peer. `healthyFrame` (the snapshot of this frame) is
+// declared further down, so it cannot be referenced here.
+federationFrame = { ...federationFrame, peerId: 'f-1' }
+
+// The badge must now be live in the *other* root, without the panel re-rendering.
+const iconTree2 = renderRoot(Icon, { size: 18, active: true })
+await settle()
+check('the self-drawn badge appears on the panel row once data has arrived',
+  textOf(iconTree2).includes('1'), JSON.stringify(textOf(iconTree2)))
+// The badge's tooltip is a translated string, not a baked-in literal. The two
+// counts differ on purpose — the header reads 条运行中, the badge 条正在运行 — so
+// matching the badge's own wording pins `fed.badgeTitle` and not `fed.runningCount`.
+const badgeTitle = findAll(iconTree2, 'span')
+  .map(node => node.props.title)
+  .find(title => typeof title === 'string' && title.includes('条正在运行'))
+check('...and the badge tooltip comes from the dictionary, not a hardcoded literal',
+  badgeTitle === '1 条正在运行', String(badgeTitle))
+
+// ── the failure taxonomy is shown, never swallowed ─────────────────────────
+const healthyFrame = federationFrame
+federationFrame = {
+  ...healthyFrame,
+  status: 'error',
+  snapshot: undefined,
+  error: { code: 'unauthorized', message: '远端返回 401：登录凭据无效或已过期' },
+}
+const errorTree = renderRoot(Panel, {})
+await settle()
+const errorText = textOf(errorTree)
+check('a credential failure is shown with its code', errorText.includes('unauthorized'), errorText.slice(0, 120))
+check('a credential failure states the correction, not just the symptom',
+  errorText.includes('重新粘贴') || errorText.includes('token'), errorText.slice(0, 240))
+
+// A gateway/internal failure has one notorious cause on the remote, and the
+// panel is the only place the user can learn it.
+federationFrame = {
+  ...healthyFrame,
+  status: 'error',
+  snapshot: undefined,
+  error: { code: 'gateway/internal', message: 'session persistence listing failed' },
+}
+const brokenTree = renderRoot(Panel, {})
+await settle()
+check('the corrupt-remote-session failure names its remote-side cause',
+  textOf(brokenTree).includes('损坏的会话文件'),
+  textOf(brokenTree).slice(0, 200))
+
+// A 403 is the one failure that must NOT invite a retry: it is a policy
+// answer, and retrying it is how a user ends up hammering a fence.
+federationFrame = {
+  ...healthyFrame,
+  status: 'error',
+  snapshot: undefined,
+  error: { code: 'forbidden', message: '远端返回 403：被访问栅栏拒绝' },
+}
+const forbiddenTree = renderRoot(Panel, {})
+await settle()
+check('a fence rejection tells the user not to retry', textOf(forbiddenTree).includes('不要反复重试'),
+  textOf(forbiddenTree).slice(0, 240))
+
+// Stale data must stay readable but never look live.
+federationFrame = {
+  ...healthyFrame,
+  status: 'error',
+  error: { code: 'http-timeout', message: '请求超时：远端实例可能没有运行' },
+}
+const staleTree = renderRoot(Panel, {})
+await settle()
+const staleText = textOf(staleTree)
+check('a stale snapshot stays on screen when the remote goes down',
+  staleText.includes('修 build 脚本') && staleText.includes('快照'),
+  staleText.slice(0, 200))
+check('the panel explains an unreachable remote', staleText.includes('远端实例可能没有运行'), staleText.slice(0, 200))
+
+// First run: with no machines at all, the panel must teach rather than sit blank.
+federationFrame = { ...healthyFrame, peers: [], snapshots: [], peerId: undefined, snapshot: undefined, status: 'idle' }
+const emptyTree = renderRoot(Panel, {})
+await settle()
+const emptyText = textOf(emptyTree)
+check('an empty panel explains what it is for', emptyText.includes('把另一台机器的会话列在这里'), emptyText.slice(0, 120))
+check('an empty panel states the read-only contract', emptyText.includes('只读'), emptyText.slice(0, 300))
+check('an empty panel offers the one action that helps',
+  findAll(emptyTree, 'button').map(textOf).includes('添加机器'),
+  findAll(emptyTree, 'button').map(textOf).join(' | '))
+
+// ── the same tree in English ────────────────────────────────────────────────
+// A language switch must reach already-rendered copy, which is the whole point
+// of looking strings up per render rather than caching them at registration.
+setLanguage('en')
+const englishTree = renderRoot(Panel, {})
+await settle()
+const englishText = textOf(englishTree)
+check('switching the language re-labels the panel',
+  englishText.includes('Remote sessions') && !englishText.includes('远端会话'),
+  englishText.slice(0, 120))
+check('switching the language re-labels the read-only contract',
+  englishText.includes('Read-only'), englishText.slice(0, 200))
+check('switching the language re-labels the panel-row registration',
+  typeof panelCapture?.options?.label === 'function' && panelCapture.options.label() === 'Remote sessions',
+  String(panelCapture?.options?.label?.()))
+
+// ── the locale service is the authority, not the DOM ───────────────────────
+// This is the regression that shipped: the panel read
+// `document.documentElement.lang`, which the shell hardcodes to "en" and never
+// updates, so a user with Chinese selected still got an English panel. The stub
+// document still says "en" here on purpose — the locale service saying "zh" must
+// win, or this fails.
+check('the stub document really does claim English (so the next assertion bites)',
+  globalThis.document.documentElement.lang === 'en',
+  globalThis.document.documentElement.lang)
+setLanguage('zh')
+const zhTree = renderRoot(Panel, {})
+await settle()
+const zhText = textOf(zhTree)
+check('the panel follows the locale service even when the DOM claims English',
+  zhText.includes('远端会话') && !zhText.includes('Remote sessions'),
+  zhText.slice(0, 120))
+check('...and the panel-row label follows it too',
+  typeof panelCapture?.options?.label === 'function' && panelCapture.options.label() === '远端会话',
+  String(panelCapture?.options?.label?.()))
+
+// A regional tag must still find its language.
+setLanguage('zh-Hans')
+const zhHansTree = renderRoot(Panel, {})
+await settle()
+check('a regional tag like zh-Hans still resolves to the Chinese dictionary',
+  textOf(zhHansTree).includes('远端会话'),
+  textOf(zhHansTree).slice(0, 80))
+
+setLanguage('zh')
+federationFrame = healthyFrame
+
+// ── the machine list is always on screen, and every row jumps directly ─────
+// Hiding it behind the manager disclosure is why the panel read as having
+// nowhere to jump from. Asserted BEFORE the manager flow below, because
+// `renderRoot` resets the harness's component store — calling it mid-flow
+// would wipe the editor state those tests build up.
+{
+  const listOnlyTree = renderRoot(Panel, {})
+  await settle()
+  check('the machine list is visible without opening the manager at all',
+    ['build-box', 'tunnel-only'].every(label =>
+      findAll(listOnlyTree, 'button').map(textOf).some(text => text.includes(label))),
+    findAll(listOnlyTree, 'button').map(textOf).join(' | ').slice(0, 220))
+  check('...and every row carries its own jump button',
+    findAll(listOnlyTree, 'button').map(textOf).filter(text => text === '打开远端').length >= 2,
+    String(findAll(listOnlyTree, 'button').map(textOf).filter(text => text === '打开远端').length))
+  check('...with the active machine marked',
+    textOf(listOnlyTree).includes('当前'),
+    textOf(listOnlyTree).slice(-140))
+}
+
+/**
+ * The 打开远端 button belonging to the row whose name contains `label`.
+ * @param {object} tree - the rendered tree.
+ * @param {string} label - the machine label.
+ * @returns {object | undefined} the button element.
+ */
+function openButtonFor(tree, label) {
+  const buttons = findAll(tree, 'button')
+  const nameAt = buttons.findIndex(button => textOf(button).includes(label))
+  return nameAt < 0 ? undefined : buttons.slice(nameAt + 1).find(button => textOf(button).trim() === '打开远端')
+}
+
+/**
+ * The 编辑 button belonging to the row whose name contains `label`.
+ *
+ * Rows are flat buttons in render order (name, 打开远端, 编辑, 移除), so the row
+ * is identified by its name and the edit button taken from what follows it.
+ * @param {object} tree - the rendered tree.
+ * @param {string} label - the machine label to look for.
+ * @returns {object | undefined} the button element.
+ */
+function editButtonFor(tree, label) {
+  const buttons = findAll(tree, 'button')
+  const nameAt = buttons.findIndex(button => textOf(button).includes(label))
+  return nameAt < 0 ? undefined : buttons.slice(nameAt + 1).find(button => textOf(button).trim() === '编辑')
+}
+// ── managing machines: the editor and the remote lifecycle ─────────────────
+// Both live inside the editor, which only appears once management is disclosed.
+calls.length = 0
+const manageTree = renderRoot(Panel, {})
+await settle()
+editButtonFor(manageTree, 'build-box')?.props.onClick()
+await settle()
+
+/** Re-render the open editor after an action settles. */
+async function editorText() {
+  await settle()
+  return textOf(manageTree)
+}
+
+let editor = await editorText()
+check('the management disclosure opens the editor', editor.includes('SSH 隧道'), editor.slice(0, 160))
+
+/**
+ * The first rendered node whose inline style sets `position: fixed`.
+ * @param {object} tree - the rendered tree.
+ * @returns {object | undefined} the node, or undefined.
+ */
+function findFixed(tree) {
+  let found
+  const visit = (node) => {
+    if (found !== undefined || node === null || node === undefined || typeof node !== 'object') return
+    if (Array.isArray(node)) { for (const child of node) visit(child); return }
+    if (node.props?.style?.position === 'fixed') { found = node; return }
+    visit(node.children)
+    visit(node.props?.children)
+  }
+  visit(tree)
+  return found
+}
+
+// Rendered inline the editor pushed the session list out of the way, squeezed a
+// 560px form into the middle of a wide panel, and scrolled away with the list —
+// so it is a fixed overlay now. `position: fixed` is also what escapes the
+// body's own `overflowY: auto`, which would clip an absolutely-positioned child.
+const overlay = findFixed(manageTree)
+check('the editor is an overlay, so it cannot push the list out of the way',
+  overlay !== undefined, String(overlay?.props?.style?.position))
+check('...it covers the viewport rather than sitting inline in the panel',
+  overlay?.props?.style?.inset === 0,
+  JSON.stringify(overlay?.props?.style ?? null).slice(0, 140))
+check('...it has an explicit close button, not only the backdrop',
+  findAll(manageTree, 'button').map(textOf).some(text => text.trim() === '关闭'),
+  findAll(manageTree, 'button').map(textOf).join(' | ').slice(0, 170))
+check('...and the backdrop is wired to close it',
+  typeof overlay?.props?.onClick === 'function',
+  typeof overlay?.props?.onClick)
+// Provisioning runs commands on the other machine, so it must be visibly
+// separate from everything else on this form.
+check('the editor offers the remote start/stop controls',
+  ['拉起远程实例', '关闭远程实例', '查看远端状态'].every(label =>
+    findAll(manageTree, 'button').map(textOf).some(text => text.includes(label))),
+  findAll(manageTree, 'button').map(textOf).join(' | '))
+check('the editor warns that a non-interactive PATH often lacks dsh',
+  editor.includes('非交互 PATH'), editor.slice(0, 500))
+
+// Two machines are saved above (`build-box` is active, `tunnel-only` is not).
+// Managing the second one must not require switching the whole panel over to it:
+// the picker lists every saved machine and rebinds the editor to the chosen row.
+check('every saved machine appears in the picker with its reach',
+  ['build-box', 'tunnel-only'].every(label => findAll(manageTree, 'button').map(textOf).some(text => text.includes(label))),
+  findAll(manageTree, 'button').map(textOf).join(' | '))
+
+/**
+ * Read one attribute from every `<input>` in the rendered editor.
+ *
+ * Text extraction cannot see `placeholder` (it is a prop, not a text child), and
+ * the stored-secret hint lives there — so the retarget check reads actual input
+ * state and the stored-secret check reads placeholders, both through here.
+ * @param {string} name - the prop to collect (`value` or `placeholder`).
+ * @param {object} [tree] - the tree to walk; defaults to `manageTree`.
+ * @returns {string[]} the collected values, in render order.
+ */
+function inputProps(name, tree = manageTree) {
+  const values = []
+  const visit = (node) => {
+    if (node === null || node === undefined || typeof node !== 'object') return
+    if (Array.isArray(node)) { for (const child of node) visit(child); return }
+    if (node.type === 'input' && node.props?.[name] !== undefined) values.push(String(node.props[name]))
+    visit(node.children)
+    visit(node.props?.children)
+  }
+  visit(tree)
+  return values
+}
+
+const beforeInputs = inputProps('value')
+check('the editor starts bound to the active machine',
+  beforeInputs.includes('192.168.1.23'),
+  JSON.stringify(beforeInputs))
+
+// A stored secret is NEVER sent back to the browser (`redactPeer` let only
+// `hasToken` / `hasPassword` cross the wire), so the input is always empty. The
+// form therefore has to SAY that something is stored — otherwise the empty box
+// reads as "my password disappeared", which is how this was reported.
+// `build-box` is the active peer and has both a stored token and hasPassword.
+check('a stored SSH password is reported as saved rather than looking empty',
+  editor.includes('SSH 密码：已保存'),
+  editor.slice(0, 200))
+check('a stored token is reported as saved too',
+  editor.includes('token：已保存'),
+  editor.slice(0, 200))
+// The empty box must also explain WHY it is empty, or it still looks broken.
+check('the empty secret boxes explain that stored credentials are not echoed',
+  inputProps('placeholder').filter(text => text.includes('不回显')).length >= 2,
+  JSON.stringify(inputProps('placeholder')))
+
+// The active peer is `build-box`; retarget to the OTHER one and assert the form
+// actually follows — this is the assertion that fails when the editor is still
+// hard-bound to `active`, and it must read input state rather than text.
+editButtonFor(manageTree, 'tunnel-only')?.props.onClick()
+await settle()
+const retargetedText = textOf(manageTree)
+const afterInputs = inputProps('value')
+check('picking another machine rebinds the editor form to it',
+  afterInputs.includes('10.0.0.9') && afterInputs.includes('2222'),
+  JSON.stringify(afterInputs))
+check('...and the previously-active machine is no longer in the form',
+  !afterInputs.includes('192.168.1.23'),
+  JSON.stringify(afterInputs))
+// `tunnel-only` has no stored password and uses a device credential, so the
+// wording must NOT claim something is saved. This is scoped to the two stored
+// labels on purpose: the plain substring `已保存` also appears in the machine
+// count ("2 台已保存") and would make the assertion pass for the wrong reason.
+check('a machine with no stored secret does not claim one is saved',
+  !retargetedText.includes('SSH 密码：已保存') && !retargetedText.includes('token：已保存'),
+  retargetedText.slice(0, 200))
+// Back to the active peer for the sections below, which drive provisioning and
+// import against `f-1`.
+editButtonFor(manageTree, 'build-box')?.props.onClick()
+await editorText()
+
+// ── adding a machine, with a non-empty list ────────────────────────────────
+// "Add" used to exist ONLY in the empty state, so once one machine was saved the
+// list could be edited and deleted but never extended by hand. It has to be
+// reachable from the manager itself.
+check('the manager offers a way to add a machine even when some are already saved',
+  findAll(manageTree, 'button').map(textOf).filter(text => text.trim() === '添加机器').length >= 1,
+  findAll(manageTree, 'button').map(textOf).join(' | '))
+const boundBeforeAdd = inputProps('value')
+findAll(manageTree, 'button').find(button => textOf(button).trim() === '添加机器')?.props.onClick()
+await editorText()
+const afterAdd = inputProps('value')
+check('adding a machine opens an EMPTY form rather than the selected machine',
+  !afterAdd.includes('192.168.1.23') && !afterAdd.includes('10.0.0.9'),
+  JSON.stringify(afterAdd))
+check('...and the form is not blank in a way that hides which mode it is in',
+  afterAdd.length > 0 && boundBeforeAdd.length > 0,
+  `${String(boundBeforeAdd.length)} -> ${String(afterAdd.length)} input(s)`)
+// Picking a saved machine must also LEAVE "new" mode, or the form stays empty
+// and the only way back to editing is collapsing the manager and reopening it.
+editButtonFor(manageTree, 'build-box')?.props.onClick()
+await editorText()
+check('picking a saved machine after "add" returns to editing that machine',
+  inputProps('value').includes('192.168.1.23'),
+  JSON.stringify(inputProps('value')))
+// Back to editing the active machine for the provisioning sections below.
+editButtonFor(manageTree, 'build-box')?.props.onClick()
+await editorText()
+
+// Status is the safe probe, and it must report what the host found rather than
+// assuming an answer.
+provisionFrame = { id: 'f-1', action: 'status', listening: false, evidence: '' }
+calls.length = 0
+findAll(manageTree, 'button').find(button => textOf(button).includes('查看远端状态'))?.props.onClick()
+editor = await editorText()
+check('checking the remote status posts the action',
+  calls.some(call => call.url.endsWith('/provision') && String(call.body).includes('"action":"status"')),
+  calls.filter(call => call.url.endsWith('/provision')).map(call => String(call.body)).join(' , ') || 'no provision call')
+check('a stopped remote is reported as stopped', editor.includes('没在运行'), editor.slice(0, 400))
+
+// Starting must report the captured token, because that is the whole reason the
+// host starts it rather than telling the user to.
+provisionFrame = { id: 'f-1', action: 'start', started: true, token: 'tok', port: 3080 }
+findAll(manageTree, 'button').find(button => textOf(button).includes('拉起远程实例'))?.props.onClick()
+editor = await editorText()
+check('a successful start reports the captured token and port',
+  editor.includes('已拉起') && editor.includes('3080'), editor.slice(0, 400))
+
+// An already-running remote must NOT be reported as freshly started: the user
+// would otherwise believe a second instance had been launched.
+provisionFrame = { id: 'f-1', action: 'start', started: false, alreadyRunning: true, port: 3080 }
+findAll(manageTree, 'button').find(button => textOf(button).includes('拉起远程实例'))?.props.onClick()
+editor = await editorText()
+check('an already-running remote is not reported as freshly started',
+  editor.includes('本来就在运行'), editor.slice(0, 400))
+
+// A provisioning failure is a classified outcome, not a thrown error.
+provisionFrame = { id: 'f-1', action: 'start', ok: false, code: 'provision-not-ready', detail: '没等到启动 URL' }
+findAll(manageTree, 'button').find(button => textOf(button).includes('拉起远程实例'))?.props.onClick()
+editor = await editorText()
+check('a provisioning failure shows its code and detail',
+  editor.includes('provision-not-ready') && editor.includes('没等到启动 URL'), editor.slice(0, 400))
+
+// Read-back is the recovery path for a remote started outside this plugin.
+provisionFrame = { id: 'f-1', action: 'read-token', found: false }
+findAll(manageTree, 'button').find(button => textOf(button).includes('从日志读回 token'))?.props.onClick()
+editor = await editorText()
+check('a log with no launch URL is explained, not silently ignored',
+  editor.includes('日志里没有启动 URL'), editor.slice(0, 400))
+
+provisionFrame = { id: 'f-1', action: 'status', listening: true, evidence: 'x' }
+
+// ── import: preview first, write second ────────────────────────────────────
+// Running the import last on purpose: a successful import closes the editor
+// (the panel re-opens on the refreshed state), so anything asserted after it
+// would be testing closed-panel markup.
+calls.length = 0
+const unmountTree = renderRoot(Panel, {})
+await settle()
+for (const store of stores.values()) {
+  for (const cleanup of store.cleanups ?? []) cleanup()
+}
+await settle()
+check('leaving the panel stops the host poller',
+  calls.some(call => call.url.endsWith('/api/federation/poll') && String(call.body).includes('"visible":false')),
+  calls.filter(call => call.url.endsWith('/poll')).map(call => String(call.body)).join(' , ') || 'no poll call')
+void unmountTree
 
 const failed = results.filter(result => !result.pass)
 console.log(`\n${String(results.length - failed.length)}/${String(results.length)} passed`)

@@ -1,14 +1,16 @@
 {
   "name": "dsh-remote-switch",
   "version": "0.1.0",
-  "description": "Instance switcher for DeepSeek Harness: keep a list of DSH instances and open any of them in a new window from a sidebar entry, so the page you are on (and its switcher) survives the switch.",
+  "description": "Two remote-instance surfaces for DeepSeek Harness: a switcher that opens another DSH instance in a new window from a sidebar entry, and a read-only sidebar panel listing another machine's sessions and running state over SSH or HTTP.",
   "keywords": [
     "deepseek-harness",
     "dsh",
     "dsh-plugin",
     "instance",
     "switcher",
-    "remote"
+    "remote",
+    "federation",
+    "ssh"
   ],
   "type": "module",
   "main": "lib/index.js",
@@ -41,7 +43,11 @@
   },
   "scripts": {
     "verify:host": "node scripts/verify-host.mjs",
-    "verify:client": "node scripts/verify-client.mjs"
+    "verify:client": "node scripts/verify-client.mjs",
+    "verify:federation": "node scripts/verify-federation.mjs",
+    "verify:provision": "node scripts/verify-provision-e2e.mjs",
+    "verify:static": "node scripts/verify-static.mjs",
+    "test-instance": "pwsh -File scripts/test-instance.ps1"
   },
   "license": "MIT",
   "repository": {
@@ -54,5 +60,9 @@
   },
   "publishConfig": {
     "access": "public"
+  },
+  "dependencies": {
+    "ssh2": "^1.17.0",
+    "ws": "^8.21.3"
   }
 }

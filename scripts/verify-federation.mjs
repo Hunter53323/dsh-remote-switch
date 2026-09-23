@@ -139,6 +139,9 @@ const rawRequest = raw => new Promise(resolve => {
     resolve({
       status: match === null ? 0 : Number(match[1]),
       body: split >= 0 ? received.slice(split + 4) : received,
+      // The raw head, so a test can assert a header is NOT there (an echoed
+      // `access-control-allow-origin` is invisible to status and body).
+      raw: received,
     })
   })
   rawSockets.push(socket)
@@ -199,6 +202,81 @@ const forgedProvision = await rawRequest(
 )
 check('a LAN caller cannot start or stop remote instances', forgedProvision.status === 403,
   `status ${String(forgedProvision.status)}`)
+
+// ── 2b. the fence must also stop the user's OWN browser ─────────────────────
+// The socket+Host check cannot tell this plugin's page from any other page open
+// in the same browser: a fetch to 127.0.0.1 from a random site satisfies both.
+// These are the cases that made the fence insufficient on its own.
+const crossSite = await rawRequest(
+  `GET /api/federation/peers HTTP/1.1\r\nHost: 127.0.0.1:${String(port)}\r\n` +
+  `sec-fetch-site: cross-site\r\nConnection: close\r\n\r\n`,
+)
+check('a cross-site browser request is refused', crossSite.status === 403,
+  `status ${String(crossSite.status)}`)
+
+const foreignOrigin = await rawRequest(
+  `GET /api/federation/peers HTTP/1.1\r\nHost: 127.0.0.1:${String(port)}\r\n` +
+  `Origin: http://evil.example\r\nConnection: close\r\n\r\n`,
+)
+check('a request from another site\'s Origin is refused', foreignOrigin.status === 403,
+  `status ${String(foreignOrigin.status)}`)
+
+// The peer list carries SSH hosts, users, ports and key paths: a page must not be
+// able to read it cross-origin, which is what reflecting an arbitrary Origin did.
+const sameOrigin = await rawRequest(
+  `GET /api/federation/peers HTTP/1.1\r\nHost: 127.0.0.1:${String(port)}\r\n` +
+  `Origin: http://127.0.0.1:${String(port)}\r\nConnection: close\r\n\r\n`,
+)
+check('the panel\'s own origin still works', sameOrigin.status === 200, `status ${String(sameOrigin.status)}`)
+check('...and no origin at all is ever echoed back as a CORS grant',
+  !sameOrigin.raw.toLowerCase().includes('access-control-allow-origin') &&
+  !crossSite.raw.toLowerCase().includes('access-control-allow-origin'),
+  sameOrigin.raw.split('\r\n').filter(line => line.toLowerCase().includes('access-control')).join(' | ') || 'no CORS headers')
+
+// A `127.`-prefixed Host is a DNS-rebinding shape: the name resolves to loopback
+// (so the socket check passes) while the attacker controls the page. A prefix
+// test cannot see that, so only a real 127/8 literal may pass.
+const rebound = await rawRequest(
+  `GET /api/federation/peers HTTP/1.1\r\nHost: 127.0.0.1.evil.com:${String(port)}\r\nConnection: close\r\n\r\n`,
+)
+check('a hostname that merely starts with "127." is not treated as loopback', rebound.status === 403,
+  `status ${String(rebound.status)}`)
+
+// ── 2c. the crash class ─────────────────────────────────────────────────────
+// A route handler that does not RETURN its promise settles the web server's
+// `await` immediately, so its rejection escapes to the host's process-level
+// handler — which answers `unhandledRejection` with `exit(1)`. One aborted
+// request used to be able to take the whole DSH instance down.
+const escaped = []
+const onEscaped = reason => { escaped.push(reason) }
+process.on('unhandledRejection', onEscaped)
+
+// Declares a 1000-byte body, sends 10 bytes, hangs up. `readJson`'s
+// `for await (const chunk of request)` rejects with ECONNRESET on exactly this.
+await new Promise(resolve => {
+  const socket = connect(port, '127.0.0.1', () => {
+    socket.write(
+      `POST /api/federation/peers HTTP/1.1\r\nHost: 127.0.0.1:${String(port)}\r\n` +
+      `content-type: application/json\r\ncontent-length: 1000\r\n\r\n{"partial"`,
+    )
+    setTimeout(() => { socket.destroy(); resolve() }, 40)
+  })
+  socket.on('error', () => {})
+  rawSockets.push(socket)
+})
+await new Promise(resolve => setTimeout(resolve, 200))
+process.off('unhandledRejection', onEscaped)
+// A malformed request-target (`GET http://[`) is caught by the web server's own
+// `handle().catch()` before any route is reached, so it is not this plugin's risk
+// and is not asserted here — the harness's minimal router does not reproduce that
+// outer catch, and asserting it would only test the harness.
+
+check('an aborted POST body escapes as nothing',
+  escaped.length === 0,
+  escaped.map(reason => String(reason?.code ?? reason)).join(' , ') || 'none escaped')
+check('...and the surface still serves requests afterwards', (await get(`${base}/peers`)).status === 200,
+  'peer list still reachable')
+
 // ── 3. the real read path over SSH direct-tcpip ─────────────────────────────
 // A local ssh2 Server stands in for the remote machine's sshd: it accepts any
 // auth and forwards `direct-tcpip` to the real instance's loopback port. That

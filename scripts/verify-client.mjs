@@ -544,8 +544,8 @@ let federationFrame = {
       label: 'build-box',
       channel: 'ssh',
       origin: 'http://127.0.0.1:3080',
-      ssh: { host: '192.168.1.23', user: 'liuyx', port: 22, remotePort: 3080, privateKeyPath: 'C:\\k', hasPassword: true },
-      auth: { kind: 'token', hasToken: true },
+      ssh: { host: '192.168.1.23', user: 'liuyx', port: 22, remotePort: 3080, privateKeyPath: 'C:\\k', hasPassword: true, password: 'pw-for-build-box' },
+      auth: { kind: 'token', hasToken: true, token: 'token-for-build-box' },
       webOrigin: 'http://192.168.1.23:3080',
       jumpUrl: 'http://192.168.1.23:3080/pair-app?device=cafe',
       createdAt: Date.now(),
@@ -1183,21 +1183,18 @@ check('the editor starts bound to the active machine',
   beforeInputs.includes('192.168.1.23'),
   JSON.stringify(beforeInputs))
 
-// A stored secret is NEVER sent back to the browser (`redactPeer` let only
-// `hasToken` / `hasPassword` cross the wire), so the input is always empty. The
-// form therefore has to SAY that something is stored — otherwise the empty box
-// reads as "my password disappeared", which is how this was reported.
-// `build-box` is the active peer and has both a stored token and hasPassword.
-check('a stored SSH password is reported as saved rather than looking empty',
-  editor.includes('SSH 密码：已保存'),
-  editor.slice(0, 200))
-check('a stored token is reported as saved too',
-  editor.includes('token：已保存'),
-  editor.slice(0, 200))
-// The empty box must also explain WHY it is empty, or it still looks broken.
-check('the empty secret boxes explain that stored credentials are not echoed',
-  inputProps('placeholder').filter(text => text.includes('不回显')).length >= 2,
-  JSON.stringify(inputProps('placeholder')))
+// Stored secrets are SHOWN now, by the owner's explicit decision: the token and
+// the SSH password are prefilled into their inputs rather than withheld behind a
+// "saved, leave empty" label. `build-box` is the active peer and has both.
+check('a stored SSH password is shown in its field',
+  inputProps('value').includes('pw-for-build-box'),
+  JSON.stringify(inputProps('value')))
+check('a stored token is shown in its field too',
+  inputProps('value').includes('token-for-build-box'),
+  JSON.stringify(inputProps('value')))
+check('...and no field still claims a secret is being withheld',
+  !textOf(manageTree).includes('不回显') && !textOf(manageTree).includes('已保存（留空保持不变）'),
+  inputProps('placeholder').join(' | ').slice(0, 200))
 
 // The active peer is `build-box`; retarget to the OTHER one and assert the form
 // actually follows — this is the assertion that fails when the editor is still
@@ -1210,14 +1207,10 @@ check('picking another machine rebinds the editor form to it',
   afterInputs.includes('10.0.0.9') && afterInputs.includes('2222'),
   JSON.stringify(afterInputs))
 check('...and the previously-active machine is no longer in the form',
-  !afterInputs.includes('192.168.1.23'),
+  !afterInputs.includes('192.168.1.23') && !afterInputs.includes('token-for-build-box'),
   JSON.stringify(afterInputs))
-// `tunnel-only` has no stored password and uses a device credential, so the
-// wording must NOT claim something is saved. This is scoped to the two stored
-// labels on purpose: the plain substring `已保存` also appears in the machine
-// count ("2 台已保存") and would make the assertion pass for the wrong reason.
-check('a machine with no stored secret does not claim one is saved',
-  !retargetedText.includes('SSH 密码：已保存') && !retargetedText.includes('token：已保存'),
+check('...and a machine with no stored secret shows empty fields, not a stale one',
+  !retargetedText.includes('token-for-build-box') && !retargetedText.includes('pw-for-build-box'),
   retargetedText.slice(0, 200))
 // Back to the active peer for the sections below, which drive provisioning and
 // import against `f-1`.

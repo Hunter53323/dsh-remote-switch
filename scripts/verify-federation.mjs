@@ -15,7 +15,9 @@
  *      the *stream* rather than the list;
  *   4. credential acquisition: `GET /?token=` → 303 → cookie, then replay;
  *   5. the loopback fence on every federation route, reads included;
- *   6. that no response ever carries a token or an SSH password;
+ *   6. that the panel hands over the stored credentials it holds — token and SSH
+ *      password in the clear, by the owner's explicit decision — while the LAN
+ *      fence still keeps the whole surface off the network;
  *   7. the P2 host surface: the SSH start/stop lifecycle — including that a
  *      start captures the token printed by the remote instance it launched.
  *
@@ -173,7 +175,7 @@ const sshPeer = await post(`${base}/peers`, {
   action: 'save',
   channel: 'ssh',
   label: 'verify-ssh',
-  ssh: { host: '127.0.0.1', user: 'tester', port: 2222, remotePort: Number(new URL(target).port) },
+  ssh: { host: '127.0.0.1', user: 'tester', port: 2222, remotePort: Number(new URL(target).port), password: 'verify-ssh-password' },
   auth: { kind: 'token', token: `${token}` },
 })
 check('an SSH peer registers', sshPeer.status === 200 && sshPeer.body?.saved !== undefined,
@@ -182,10 +184,10 @@ const savedSsh = (sshPeer.body?.peers ?? []).find(peer => peer.id === sshPeer.bo
 check('an SSH peer addresses the remote loopback, not the configured host',
   savedSsh?.origin === `http://127.0.0.1:${new URL(target).port}`,
   `origin=${String(savedSsh?.origin)}`)
-check('the SSH peer view never carries the token, the password, or a private key body',
-  savedSsh !== undefined && savedSsh.auth?.hasToken === true && savedSsh.auth.token === undefined &&
-    savedSsh.ssh.password === undefined,
-  JSON.stringify(savedSsh?.auth) + ' ' + JSON.stringify(savedSsh?.ssh))
+check('the panel hands over the stored token and SSH password in the clear',
+  savedSsh !== undefined && savedSsh.auth?.hasToken === true && savedSsh.auth.token === token &&
+    savedSsh.ssh.password === 'verify-ssh-password',
+  `${JSON.stringify(savedSsh?.auth)} ${JSON.stringify(savedSsh?.ssh)}`)
 
 // ── 1b. what "open remote" actually opens ───────────────────────────────────
 // A stored credential has to become a *working* jump, or the button can only
@@ -209,8 +211,8 @@ check('...URL-encoded rather than concatenated raw',
   String(tokenJumpRow?.jumpUrl).includes(encodeURIComponent(jumpToken)) &&
     !String(tokenJumpRow?.jumpUrl).includes(jumpToken),
   String(tokenJumpRow?.jumpUrl))
-check('...and the token is still not exposed as a readable view field',
-  tokenJumpRow?.auth?.token === undefined && tokenJumpRow?.auth?.hasToken === true,
+check('...and the token is available to the panel in the clear (owner\'s decision)',
+  tokenJumpRow?.auth?.token === jumpToken && tokenJumpRow?.auth?.hasToken === true,
   JSON.stringify(tokenJumpRow?.auth ?? null))
 check('...and it is not ALSO offered as a bare, unauthenticated origin',
   tokenJumpRow?.openOrigin === undefined, String(tokenJumpRow?.openOrigin))
@@ -690,8 +692,11 @@ check('and the start succeeds, capturing the token that login-shell launch print
 // The token itself must never reach the browser: it is full control of that
 // instance, and the response is read by a page. The observable proof that it was
 // captured and stored is the peer's own `hasToken` flag.
-check('...without sending the token itself back to the browser',
-  JSON.stringify(nvmStart.body ?? {}).includes('NVMTEST') === false,
+// The panel is handed the stored credential itself now (owner's decision), so the
+// observable proof that the capture worked is that the peer list carries exactly
+// the token the launch printed.
+check('...and the peer list carries exactly the token that launch printed',
+  JSON.stringify(nvmStart.body ?? {}).includes('NVMTEST') === true,
   JSON.stringify(nvmStart.body?.provision ?? null).slice(0, 200))
 const afterNvmStart = await post(`${base}/peers`, { action: 'touch', id: nvmStart.body?.provision?.id })
 check('...and the captured token is on the stored peer instead',
@@ -721,8 +726,8 @@ const startedPeer = (afterStart.body?.peers ?? []).find(peer => peer.id === save
 check('the captured token is stored on the peer',
   startedPeer?.auth?.hasToken === true && startedPeer?.ssh?.remotePort === 3199,
   JSON.stringify({ auth: startedPeer?.auth, remotePort: startedPeer?.ssh?.remotePort }))
-check('the stored token is never echoed back to the browser',
-  JSON.stringify(afterStart.body ?? {}).includes('CAPTURED_TOKEN_123') === false,
+check('...and the panel is handed the stored token itself, not just a flag',
+  startedPeer?.auth?.token === 'CAPTURED_TOKEN_123',
   JSON.stringify(startedPeer?.auth ?? null))
 
 // Stopping: the pid recorded on the REMOTE is read first, then the port holder.
@@ -845,9 +850,9 @@ const logsRead = await post(`${base}/provision`, { id: savedSsh?.id, action: 'lo
 check('the remote log can be read on demand',
   typeof logsRead.body?.provision?.log === 'string' && logsRead.body.provision.log.includes('dsh web:'),
   JSON.stringify(logsRead.body?.provision ?? null).slice(0, 160))
-check('...with the launch token masked out of it',
-  logsRead.body?.provision?.log.includes('token=***') &&
-    !JSON.stringify(logsRead.body ?? {}).includes('SECRET_IN_THE_LOG'),
+check('...and the log is shown as the remote wrote it, token included',
+  String(logsRead.body?.provision?.log).includes('token=SECRET_IN_THE_LOG') &&
+    String(logsRead.body?.provision?.log).includes('dsh web:'),
   String(logsRead.body?.provision?.log ?? '').slice(0, 200))
 // The ports and addresses must SURVIVE: comparing them against the configured
 // jump address is the reason to look at this log at all.

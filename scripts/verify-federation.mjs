@@ -433,7 +433,9 @@ if (token === '') {
     sessions.body?.snapshot?.groups?.map(group => `${group.label}:${String(group.sessions.length)}`).join(' , ') ?? 'none')
 
   // The credential must now be cached, so a second read replays the cookie
-  // instead of redeeming the token again (the token is one-shot per launch).
+  // instead of redeeming the token again. (Not because the token is one-shot —
+  // measured: the same token answers `GET /?token=` with 303 three times over.
+  // What retires a token is a RESTART, not a use.)
   const cached = await post(`${base}/sessions`, { peerId: savedSsh?.id, force: true })
   check('a second read reuses the cached credential', cached.status === 200 && cached.body?.status === 'ok',
     `status=${String(cached.body?.status)}`)
@@ -573,6 +575,43 @@ check('the launcher writes the log and the pid file under the remote DSH_HOME',
   execd.some(command => command.includes('/srv/.dsh/federation/web.log') && command.includes('web.pid')),
   execd.filter(command => command.includes('web.log')).join(' | ').slice(0, 240))
 
+// ── 6b. the instance is already running ─────────────────────────────────────
+// "Already running, nothing restarted" must not be the end of the story: the
+// remote prints a NEW token on every boot, so the reason anyone presses start on
+// a running instance is that the token they hold stopped working. `force` is how
+// they get the current one — and it has to mean RESTART (stop, then launch),
+// because the running process still holds the port and the log is cleared only
+// at launch, which is the only moment this plugin can learn a new token.
+const runningResponder = command => {
+  if (command.includes('uname')) return 'Linux\n'
+  if (command.includes('ss -ltn') || command.includes('netstat')) {
+    return `LISTEN 0 128 127.0.0.1:${String(remotePort)} 0.0.0.0:*\n`
+  }
+  if (command.includes('echo $! >') && command.includes('cat ')) return '4242\n'
+  if (command.includes('web.pid')) return '4242\n'
+  if (command.includes('kill ')) return 'killed\n'
+  if (command.includes('tail -n')) return `dsh web: http://127.0.0.1:3080/?token=${token}\n`
+  return ''
+}
+execd.length = 0
+execResponder = runningResponder
+const alreadyUp = await post(`${base}/provision`, { id: savedSsh?.id, action: 'start', remoteHome: '/srv/.dsh' })
+check('starting an instance that is already listening launches no second one',
+  alreadyUp.body?.provision?.started === false && alreadyUp.body?.provision?.alreadyRunning === true &&
+    !execd.some(command => command.includes('setsid')),
+  JSON.stringify({ started: alreadyUp.body?.provision?.started, alreadyRunning: alreadyUp.body?.provision?.alreadyRunning }))
+
+execd.length = 0
+execResponder = runningResponder
+const restarted = await post(`${base}/provision`, { id: savedSsh?.id, action: 'start', remoteHome: '/srv/.dsh', force: true })
+const stopAt = execd.findIndex(command => command.includes('kill ') || command.includes('fuser') || command.includes('lsof'))
+const launchAt = execd.findIndex(command => command.includes('setsid'))
+check('a forced start stops the running instance first, then launches',
+  stopAt >= 0 && launchAt > stopAt, `stopAt=${String(stopAt)} launchAt=${String(launchAt)}`)
+check('...and it comes back with the token the new boot printed',
+  restarted.body?.provision?.started === true && restarted.body?.provision?.credentialChanged === true,
+  JSON.stringify(restarted.body?.provision ?? null).slice(0, 200))
+
 // A non-interactive SSH PATH does not contain nvm/volta/asdf installs, so a bare
 // `nohup dsh …` dies with "failed to run command 'dsh'" while an interactive
 // `ssh host` followed by `dsh web` works perfectly. Two things close that gap:
@@ -696,15 +735,57 @@ check('a stop that found nothing reports that, not success',
   JSON.stringify(stoppedNothing.body?.provision ?? null).slice(0, 160))
 
 // read-token: the recovery path for an instance this plugin did not start.
+// The log names the port that boot came up on, so it is also the port the
+// candidate is validated against — here that has to be the real target's, or the
+// tunnel would reach nothing.
+const targetPort = new URL(target).port
 execResponder = command => {
   if (command.includes('uname')) return 'Linux\n'
-  if (command.includes('tail -n')) return 'dsh web: http://127.0.0.1:3080/?token=READBACK_TOKEN\n'
+  if (command.includes('tail -n')) return `dsh web: http://127.0.0.1:${targetPort}/?token=${token}\n`
   return ''
 }
 const readBack = await post(`${base}/provision`, { id: savedSsh?.id, action: 'read-token', remoteHome: '/srv/.dsh' })
 check('reading the token back from the log reports success',
   readBack.body?.provision?.found === true && readBack.body?.provision?.credentialChanged === true,
   JSON.stringify(readBack.body?.provision ?? null).slice(0, 160))
+
+// The log is only written when THIS plugin starts the instance, and only cleared
+// at that moment — so an instance started by hand (or after a reboot) leaves the
+// PREVIOUS boot's token lying in it. Storing that would swap one dead credential
+// for another and report success, which is exactly how "the token never updates"
+// presents. Hence: a candidate the remote rejects must not be kept.
+execResponder = command => {
+  if (command.includes('uname')) return 'Linux\n'
+  if (command.includes('tail -n')) return `dsh web: http://127.0.0.1:${targetPort}/?token=TOKEN_FROM_AN_EARLIER_BOOT\n`
+  return ''
+}
+const staleRead = await post(`${base}/provision`, { id: savedSsh?.id, action: 'read-token', remoteHome: '/srv/.dsh' })
+check('a log token the remote rejects is refused, not stored',
+  staleRead.body?.provision?.found === false && staleRead.body?.provision?.code === 'token-stale',
+  JSON.stringify(staleRead.body?.provision ?? null).slice(0, 200))
+// The proof that matters: the stored credential is still the working one. Asking
+// the store directly keeps this honest even if the peer's own port has since been
+// changed by another check in this suite.
+const storedAfterStale = JSON.parse(readFileSync(federationFile, 'utf8')).peers.find(peer => peer.id === savedSsh?.id)
+check('...and the stored credential is still the working one, not the stale candidate',
+  storedAfterStale?.auth?.token === token && !JSON.stringify(storedAfterStale).includes('TOKEN_FROM_AN_EARLIER_BOOT'),
+  `stored=${String(storedAfterStale?.auth?.kind)} hasToken=${String(typeof storedAfterStale?.auth?.token === 'string')}`)
+
+// A failure that is NOT a credential verdict must not be reported as a stale
+// token: unreachable is a different answer from rejected, and relabelling it
+// would be the same class of lie this branch was added to remove.
+execResponder = command => {
+  if (command.includes('uname')) return 'Linux\n'
+  if (command.includes('ss -ltn') || command.includes('netstat')) return ''
+  if (command.includes('tail -n')) return 'dsh web: http://127.0.0.1:3199/?token=ANY_TOKEN\n'
+  return ''
+}
+const unreachableRead = await post(`${base}/provision`, { id: savedSsh?.id, action: 'read-token', remoteHome: '/srv/.dsh' })
+check('an unverifiable log token is reported as unverifiable, not as stale',
+  unreachableRead.body?.provision?.found === false &&
+    unreachableRead.body?.provision?.code !== 'token-stale' &&
+    typeof unreachableRead.body?.provision?.code === 'string',
+  JSON.stringify(unreachableRead.body?.provision ?? null).slice(0, 200))
 
 // A Windows remote IS supported now (the launch goes through WMI), so the old
 // "refused as unsupported-platform" expectation is gone. What must still hold is

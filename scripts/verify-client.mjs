@@ -1142,7 +1142,7 @@ check('...and the backdrop is wired to close it',
 // Provisioning runs commands on the other machine, so it must be visibly
 // separate from everything else on this form.
 check('the editor offers the remote start/stop controls',
-  ['拉起远程实例', '关闭远程实例', '查看远端状态'].every(label =>
+  ['拉起远程实例', '关闭远程实例', '查看远端状态', '重启并重新捕获 token'].every(label =>
     findAll(manageTree, 'button').map(textOf).some(text => text.includes(label))),
   findAll(manageTree, 'button').map(textOf).join(' | '))
 check('the editor warns that a non-interactive PATH often lacks dsh',

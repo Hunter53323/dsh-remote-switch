@@ -1350,8 +1350,8 @@ federationFrame = {
 }
 const tokenJumpTree = renderRoot(Panel, {})
 await settle()
-check('a token jump is flagged as needing one reload',
-  textOf(tokenJumpTree).includes('按一次刷新'),
+check('a token jump is flagged as stopping at the login page',
+  textOf(tokenJumpTree).includes('SameSite=Strict'),
   textOf(tokenJumpTree).slice(-300))
 federationFrame = {
   ...federationFrame,
@@ -1359,8 +1359,8 @@ federationFrame = {
 }
 const pairedJumpTree = renderRoot(Panel, {})
 await settle()
-check('...and a paired-device jump, which completes on its own, is not',
-  !textOf(pairedJumpTree).includes('按一次刷新'),
+check('...and a paired-device jump, which lands on the remote\'s own page, is not',
+  !textOf(pairedJumpTree).includes('SameSite=Strict'),
   textOf(pairedJumpTree).slice(-300))
 
 // ── leaving the panel ──────────────────────────────────────────────────────

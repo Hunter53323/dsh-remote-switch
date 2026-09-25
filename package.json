@@ -1,6 +1,6 @@
 {
   "name": "dsh-remote-switch",
-  "version": "0.2.6",
+  "version": "0.2.7",
   "description": "Two remote-instance surfaces for DeepSeek Harness: a switcher that opens another DSH instance in a new window from a sidebar entry, and a read-only sidebar panel listing another machine's sessions and running state over SSH or HTTP.",
   "keywords": [
     "deepseek-harness",

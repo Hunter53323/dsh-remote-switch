@@ -1333,10 +1333,39 @@ check('an absent remote log is explained rather than shown as blank',
 
 provisionFrame = { id: 'f-1', action: 'status', listening: true, evidence: 'x' }
 
-// ── import: preview first, write second ────────────────────────────────────
-// Running the import last on purpose: a successful import closes the editor
-// (the panel re-opens on the refreshed state), so anything asserted after it
-// would be testing closed-panel markup.
+// ── the token jump's one-hop problem ───────────────────────────────────────
+// A token jump cannot COMPLETE from here: the harness's browser-session cookie is
+// `SameSite=Strict` (dsh-client-connection), so opening the remote from a
+// different origin is a cross-site-initiated navigation, on which the browser will
+// not attach that Strict cookie — the redeem's 303 to `/` therefore arrives
+// without the cookie it just minted. The address bar flashing the token and then
+// going bare IS that 303, i.e. proof the token was accepted. A reload is
+// same-site, so the panel has to say so rather than let it read as a bad token.
+const deviceJump = federationFrame.peers[0].jumpUrl
+federationFrame = {
+  ...federationFrame,
+  peers: federationFrame.peers.map((peer, index) => (index === 0
+    ? { ...peer, jumpUrl: 'http://192.168.1.23:3080/?token=tok' }
+    : peer)),
+}
+const tokenJumpTree = renderRoot(Panel, {})
+await settle()
+check('a token jump is flagged as needing one reload',
+  textOf(tokenJumpTree).includes('按一次刷新'),
+  textOf(tokenJumpTree).slice(-300))
+federationFrame = {
+  ...federationFrame,
+  peers: federationFrame.peers.map((peer, index) => (index === 0 ? { ...peer, jumpUrl: deviceJump } : peer)),
+}
+const pairedJumpTree = renderRoot(Panel, {})
+await settle()
+check('...and a paired-device jump, which completes on its own, is not',
+  !textOf(pairedJumpTree).includes('按一次刷新'),
+  textOf(pairedJumpTree).slice(-300))
+
+// ── leaving the panel ──────────────────────────────────────────────────────
+// The panel is re-rendered here and then has its effect cleanups run, to prove
+// that going away stops the host's poller (a poller with no viewer is pure waste).
 calls.length = 0
 const unmountTree = renderRoot(Panel, {})
 await settle()

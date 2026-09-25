@@ -1142,7 +1142,7 @@ check('...and the backdrop is wired to close it',
 // Provisioning runs commands on the other machine, so it must be visibly
 // separate from everything else on this form.
 check('the editor offers the remote start/stop controls',
-  ['拉起远程实例', '关闭远程实例', '查看远端状态', '重启并重新捕获 token'].every(label =>
+  ['拉起远程实例', '关闭远程实例', '查看远端状态', '重启并重新捕获 token', '查看远端日志'].every(label =>
     findAll(manageTree, 'button').map(textOf).some(text => text.includes(label))),
   findAll(manageTree, 'button').map(textOf).join(' | '))
 check('the editor warns that a non-interactive PATH often lacks dsh',
@@ -1313,6 +1313,30 @@ findAll(manageTree, 'button').find(button => textOf(button).includes('从日志�
 editor = await editorText()
 check('a log with no launch URL is explained, not silently ignored',
   editor.includes('日志里没有启动 URL'), editor.slice(0, 400))
+
+// The user's own debugging view: the remote's log, with the token masked by the
+// host. It used to appear only as part of a FAILED start, which is no help when
+// the start reports success and the browser still cannot get in.
+provisionFrame = {
+  id: 'f-1',
+  action: 'logs',
+  log: 'dsh web: http://127.0.0.1:3080/?token=*** (LAN: http://10.9.9.9:3080/?token=***)',
+}
+calls.length = 0
+findAll(manageTree, 'button').find(button => textOf(button).includes('查看远端日志'))?.props.onClick()
+editor = await editorText()
+check('the editor can show the remote log on demand',
+  editor.includes('查看远端日志') && editor.includes('127.0.0.1:3080') && editor.includes('10.9.9.9:3080'),
+  editor.slice(0, 400))
+check('...and reading the log is a provision request the host can answer',
+  calls.some(call => call.url.endsWith('/provision') && String(call.body).includes('"action":"logs"')),
+  calls.filter(call => call.url.endsWith('/provision')).map(call => String(call.body)).join(' , ') || 'no provision call')
+
+provisionFrame = { id: 'f-1', action: 'logs', log: '', empty: true, detail: '远端那份日志是空的或不存在：这台实例可能不是本插件拉起的' }
+findAll(manageTree, 'button').find(button => textOf(button).includes('查看远端日志'))?.props.onClick()
+editor = await editorText()
+check('an absent remote log is explained rather than shown as blank',
+  editor.includes('不是本插件拉起'), editor.slice(0, 300))
 
 provisionFrame = { id: 'f-1', action: 'status', listening: true, evidence: 'x' }
 

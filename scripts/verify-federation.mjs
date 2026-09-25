@@ -831,6 +831,38 @@ check('an unverifiable log token is reported as unverifiable, not as stale',
     typeof unreachableRead.body?.provision?.code === 'string',
   JSON.stringify(unreachableRead.body?.provision ?? null).slice(0, 200))
 
+// The panel can show the remote log on demand. It is the only place "which port
+// did it really come up on, and why did it not" exists — and it used to be shown
+// only as part of a FAILED start, which is useless when the start reports success
+// but the browser still cannot get in.
+const rawLogLine = 'dsh web: http://127.0.0.1:3080/?token=SECRET_IN_THE_LOG (LAN: http://10.9.9.9:3080/?token=SECRET_IN_THE_LOG)'
+execResponder = command => {
+  if (command.includes('uname')) return 'Linux\n'
+  if (command.includes('tail -n')) return `${rawLogLine}\n`
+  return ''
+}
+const logsRead = await post(`${base}/provision`, { id: savedSsh?.id, action: 'logs', remoteHome: '/srv/.dsh' })
+check('the remote log can be read on demand',
+  typeof logsRead.body?.provision?.log === 'string' && logsRead.body.provision.log.includes('dsh web:'),
+  JSON.stringify(logsRead.body?.provision ?? null).slice(0, 160))
+check('...with the launch token masked out of it',
+  logsRead.body?.provision?.log.includes('token=***') &&
+    !JSON.stringify(logsRead.body ?? {}).includes('SECRET_IN_THE_LOG'),
+  String(logsRead.body?.provision?.log ?? '').slice(0, 200))
+// The ports and addresses must SURVIVE: comparing them against the configured
+// jump address is the reason to look at this log at all.
+check('...but the port and address it reported are still visible',
+  String(logsRead.body?.provision?.log).includes('127.0.0.1:3080') &&
+    String(logsRead.body?.provision?.log).includes('10.9.9.9:3080'),
+  String(logsRead.body?.provision?.log ?? '').slice(0, 200))
+// A remote this plugin never started has no log at all, and that must read as
+// "nothing to show here", not as an empty view that looks like a working one.
+execResponder = command => (command.includes('uname') ? 'Linux\n' : '')
+const noLogs = await post(`${base}/provision`, { id: savedSsh?.id, action: 'logs', remoteHome: '/srv/.dsh' })
+check('an empty remote log says so rather than looking like a working view',
+  noLogs.body?.provision?.empty === true && typeof noLogs.body?.provision?.detail === 'string',
+  JSON.stringify(noLogs.body?.provision ?? null).slice(0, 200))
+
 // A Windows remote IS supported now (the launch goes through WMI), so the old
 // "refused as unsupported-platform" expectation is gone. What must still hold is
 // that the attempt fails with a CLASSIFIED reason when the platform cannot be

@@ -1266,10 +1266,31 @@ check('a stopped remote is reported as stopped', editor.includes('没在运行')
 // Starting must report the captured token, because that is the whole reason the
 // host starts it rather than telling the user to.
 provisionFrame = { id: 'f-1', action: 'start', started: true, token: 'tok', port: 3080 }
+const sessionsBeforeStart = calls.filter(call => call.url.endsWith('/sessions')).length
 findAll(manageTree, 'button').find(button => textOf(button).includes('拉起远程实例'))?.props.onClick()
 editor = await editorText()
 check('a successful start reports the captured token and port',
   editor.includes('已拉起') && editor.includes('3080'), editor.slice(0, 400))
+// A restart replaces this peer's token, and the panel is otherwise still holding
+// the peer list it loaded BEFORE that — so the very next "open remote" would hand
+// the browser the previous token and land on the harness's 401 page. The panel
+// has to re-read as part of the action, not on the next 15s poll.
+check('...and the panel re-reads, so the jump URL is not left one token behind',
+  calls.filter(call => call.url.endsWith('/sessions')).length > sessionsBeforeStart,
+  `${String(calls.filter(call => call.url.endsWith('/sessions')).length - sessionsBeforeStart)} extra /sessions call(s)`)
+
+// The same must hold for the restart button, whose whole purpose is a new token.
+provisionFrame = { id: 'f-1', action: 'start', started: true, token: 'tok2', port: 3080 }
+const sessionsBeforeRestart = calls.filter(call => call.url.endsWith('/sessions')).length
+const restart = findAll(manageTree, 'button').find(button => textOf(button).includes('重启并重新捕获 token'))
+restart?.props.onClick()
+editor = await editorText()
+check('the restart button asks the host to force a restart',
+  calls.some(call => call.url.endsWith('/provision') && String(call.body).includes('"force":true')),
+  calls.filter(call => call.url.endsWith('/provision')).map(call => String(call.body)).slice(-2).join(' , ') || 'no provision call')
+check('...and it re-reads the panel too',
+  calls.filter(call => call.url.endsWith('/sessions')).length > sessionsBeforeRestart,
+  `${String(calls.filter(call => call.url.endsWith('/sessions')).length - sessionsBeforeRestart)} extra /sessions call(s)`)
 
 // An already-running remote must NOT be reported as freshly started: the user
 // would otherwise believe a second instance had been launched.

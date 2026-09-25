@@ -582,17 +582,39 @@ check('the launcher writes the log and the pid file under the remote DSH_HOME',
 // they get the current one — and it has to mean RESTART (stop, then launch),
 // because the running process still holds the port and the log is cleared only
 // at launch, which is the only moment this plugin can learn a new token.
+/**
+ * A fake listener answer on the port the plugin is actually checking.
+ *
+ * The port is not in the command — `status` runs `ss -ltn || netstat -ltn` and
+ * filters in JS by the peer's stored `remotePort` — and earlier checks in this
+ * suite change that value. Announcing a stale port silently reads as "nothing is
+ * listening", which is exactly the trap this helper exists to avoid. So it is
+ * read from the store, the same place the plugin reads it.
+ * @returns {string} a `LISTEN` line for the peer's current port.
+ */
+const listenLineFor = () => {
+  let port = Number(new URL(target).port)
+  try {
+    const peers = JSON.parse(readFileSync(federationFile, 'utf8')).peers
+    port = peers.find(peer => peer.id === savedSsh?.id)?.ssh?.remotePort ?? port
+  } catch { /* fall back to the target's own port */ }
+  return `LISTEN 0 128 127.0.0.1:${String(port)} 0.0.0.0:*\n`
+}
 const runningResponder = command => {
   if (command.includes('uname')) return 'Linux\n'
   if (command.includes('ss -ltn') || command.includes('netstat')) {
-    return `LISTEN 0 128 127.0.0.1:${String(remotePort)} 0.0.0.0:*\n`
+    return remoteRunning ? listenLineFor() : ''
   }
   if (command.includes('echo $! >') && command.includes('cat ')) return '4242\n'
   if (command.includes('web.pid')) return '4242\n'
-  if (command.includes('kill ')) return 'killed\n'
+  // The fake remote actually goes down when killed, so the port is free
+  // afterwards — a remote that kept reporting a listener would (correctly) be
+  // refused by the guard below.
+  if (command.includes('kill ')) { remoteRunning = false; return 'killed\n' }
   if (command.includes('tail -n')) return `dsh web: http://127.0.0.1:3080/?token=${token}\n`
   return ''
 }
+let remoteRunning = true
 execd.length = 0
 execResponder = runningResponder
 const alreadyUp = await post(`${base}/provision`, { id: savedSsh?.id, action: 'start', remoteHome: '/srv/.dsh' })
@@ -602,6 +624,7 @@ check('starting an instance that is already listening launches no second one',
   JSON.stringify({ started: alreadyUp.body?.provision?.started, alreadyRunning: alreadyUp.body?.provision?.alreadyRunning }))
 
 execd.length = 0
+remoteRunning = true
 execResponder = runningResponder
 const restarted = await post(`${base}/provision`, { id: savedSsh?.id, action: 'start', remoteHome: '/srv/.dsh', force: true })
 const stopAt = execd.findIndex(command => command.includes('kill ') || command.includes('fuser') || command.includes('lsof'))
@@ -611,6 +634,27 @@ check('a forced start stops the running instance first, then launches',
 check('...and it comes back with the token the new boot printed',
   restarted.body?.provision?.started === true && restarted.body?.provision?.credentialChanged === true,
   JSON.stringify(restarted.body?.provision ?? null).slice(0, 200))
+
+// A restart that did NOT stop anything is worse than no restart: the old
+// instance keeps the port, so the browser goes on talking to IT while this plugin
+// captures the new one's token — and the harness answers that mismatch with its
+// 401 page, which reads as "the new token does not work". So the stop is
+// confirmed before launching, not assumed.
+execd.length = 0
+execResponder = command => {
+  if (command.includes('uname')) return 'Linux\n'
+  // Stubbornly still listening, and the kill does not take.
+  if (command.includes('ss -ltn') || command.includes('netstat')) return listenLineFor()
+  if (command.includes('web.pid')) return '4242\n'
+  if (command.includes('kill ')) return 'killed\n'
+  if (command.includes('echo $! >') && command.includes('cat ')) return '4242\n'
+  return ''
+}
+const stuck = await post(`${base}/provision`, { id: savedSsh?.id, action: 'start', remoteHome: '/srv/.dsh', force: true })
+check('a forced start refuses to launch when the port never frees up',
+  stuck.body?.provision?.ok === false && stuck.body?.provision?.code === 'provision-stop-failed' &&
+    !execd.some(command => command.includes('setsid')),
+  JSON.stringify(stuck.body?.provision ?? null).slice(0, 220))
 
 // A non-interactive SSH PATH does not contain nvm/volta/asdf installs, so a bare
 // `nohup dsh …` dies with "failed to run command 'dsh'" while an interactive

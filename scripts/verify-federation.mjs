@@ -29,7 +29,7 @@
 
 import { createServer } from 'node:http'
 import { connect } from 'node:net'
-import { mkdtempSync, readFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
@@ -50,6 +50,11 @@ const workDir = mkdtempSync(path.join(tmpdir(), 'federation-verify-'))
 const federationFile = path.join(workDir, 'peers.json')
 const knownHostsFile = path.join(workDir, 'known_hosts.json')
 const cacheFile = path.join(workDir, 'credentials.json')
+// The instance-switcher store, which is where a peer's paired-device credential
+// lives. Pointed into the temp dir so the suite never reads — or writes — the
+// developer's real pairing state, and so a jump-URL test can create a pairing
+// deliberately.
+const devicePeersFile = path.join(workDir, 'instance-switcher-peers.json')
 const { apply } = await import('../lib/index.js')
 
 /** Closed-over state the stub context exposes. */
@@ -69,6 +74,7 @@ const stubCtx = {
 }
 
 const dispose = apply(stubCtx, {
+  peersFile: devicePeersFile,
   federation: {
     federationFile,
     knownHostsFile,
@@ -180,6 +186,56 @@ check('the SSH peer view never carries the token, the password, or a private key
   savedSsh !== undefined && savedSsh.auth?.hasToken === true && savedSsh.auth.token === undefined &&
     savedSsh.ssh.password === undefined,
   JSON.stringify(savedSsh?.auth) + ' ' + JSON.stringify(savedSsh?.ssh))
+
+// ── 1b. what "open remote" actually opens ───────────────────────────────────
+// A stored credential has to become a *working* jump, or the button can only
+// land on a login wall. A token-only peer — any machine this one has never
+// paired, which is every freshly set-up computer — used to get a bare origin and
+// nothing else, so the token the plugin had just captured looked unused.
+const jumpToken = 'jump token/with?specials'
+const tokenJump = await post(`${base}/peers`, {
+  action: 'save',
+  channel: 'ssh',
+  label: 'verify-token-jump',
+  ssh: { host: '10.9.9.9', user: 'jumper', port: 22, remotePort: 3080 },
+  webOrigin: 'http://10.9.9.9:3080',
+  auth: { kind: 'token', token: jumpToken },
+})
+const tokenJumpRow = (tokenJump.body?.peers ?? []).find(peer => peer.label === 'verify-token-jump')
+check('a token peer with a web address gets a jump URL carrying that token',
+  tokenJumpRow?.jumpUrl === `http://10.9.9.9:3080/?token=${encodeURIComponent(jumpToken)}`,
+  String(tokenJumpRow?.jumpUrl))
+check('...URL-encoded rather than concatenated raw',
+  String(tokenJumpRow?.jumpUrl).includes(encodeURIComponent(jumpToken)) &&
+    !String(tokenJumpRow?.jumpUrl).includes(jumpToken),
+  String(tokenJumpRow?.jumpUrl))
+check('...and the token is still not exposed as a readable view field',
+  tokenJumpRow?.auth?.token === undefined && tokenJumpRow?.auth?.hasToken === true,
+  JSON.stringify(tokenJumpRow?.auth ?? null))
+check('...and it is not ALSO offered as a bare, unauthenticated origin',
+  tokenJumpRow?.openOrigin === undefined, String(tokenJumpRow?.openOrigin))
+
+// A pairing must still win, because this is the setup a machine that has already
+// paired the remote is in: its `/pair-app` landing is cookieless and does not go
+// stale when the remote reprints its token.
+mkdirSync(path.dirname(devicePeersFile), { recursive: true })
+writeFileSync(devicePeersFile, JSON.stringify({
+  version: 1,
+  peers: [{
+    id: 'p-verify-device',
+    label: 'paired',
+    origin: 'http://10.9.9.9:3080',
+    credential: 'device-cred-1',
+    createdAt: Date.now(),
+  }],
+}))
+const pairedList = await get(`${base}/peers`)
+const pairedRow = (pairedList.body?.peers ?? []).find(peer => peer.label === 'verify-token-jump')
+check('a paired-device credential takes precedence over the peer\'s own token',
+  pairedRow?.jumpUrl === 'http://10.9.9.9:3080/pair-app?device=device-cred-1',
+  String(pairedRow?.jumpUrl))
+// Put it back: every later check in this suite expects no pairing to exist.
+writeFileSync(devicePeersFile, JSON.stringify({ version: 1, peers: [] }))
 
 // ── 2. the loopback fence, reads included ───────────────────────────────────
 const forgedRead = await rawRequest(

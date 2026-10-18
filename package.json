@@ -26,9 +26,6 @@
     "LICENSE"
   ],
   "dsh": {
-    "engines": {
-      "dsh": ">=0.1.5-rc.1"
-    },
     "bundle": {
       "patch": "./cordis.patch.yml"
     },
@@ -39,7 +36,7 @@
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.2",
-    "@deepseek-ai/dsh-host-webserver": "^0.1.5-rc.1"
+    "@deepseek-ai/dsh-host-webserver": "^0.1.5-rc.1 || ^0.2.0-rc.1"
   },
   "scripts": {
     "verify:host": "node scripts/verify-host.mjs",
@@ -60,6 +57,9 @@
   },
   "publishConfig": {
     "access": "public"
+  },
+  "engines": {
+    "dsh": ">=0.1.5-rc.1 <0.3.0"
   },
   "dependencies": {
     "ssh2": "^1.17.0",

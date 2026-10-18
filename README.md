@@ -133,6 +133,12 @@ dsh web
 dsh plugin --profile web add link:<本目录绝对路径>
 ```
 
+> **DSH 版本要求写在 `package.json` 顶层 `engines.dsh`**（当前是 `>=0.1.5-rc.1 <0.3.0`，0.1.5-rc.x 与 0.2.x 都覆盖）。
+> 这一条必须放顶层：DSH 启动时的兼容检查只读顶层 `engines.dsh`，**不读** `dsh.engines`；顶层缺失时它改看
+> `peerDependencies` 里每一个 `@deepseek-ai/dsh-*`，只要有一个范围不满足（例如 0.2.x 不落在 `^0.1.5-rc.1` 里），
+> 就**整条 bundle 被跳过**——日志只有一句 `skipping profile bundle "dsh-remote-switch"`，界面上则是一片空白、看不出原因。
+> 已经装过旧版本的话，要么升级到修好的版本，要么用 `dsh plugin --profile web allow-version` 给当前 DSH 版本做一次性豁免。
+
 重启后，侧栏底部（设置按钮旁）会出现一个 🌐 图标：**实例**；侧栏的全局面板区会出现 🖧 **远端会话**。
 
 卸载：
